@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vjs iOS test</title>
+<link rel="stylesheet" href="video-js.min.css">
+<style>
+  body { font: 14px -apple-system, sans-serif; margin: 12px; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  #host { width: 320px; height: 180px; background: #ddd; margin: 8px 0; }
+  #host video, #host .video-js { width: 320px; height: 180px; }
+  pre { white-space: pre-wrap; font-size: 11px; background: #f4f4f4; padding: 8px; }
+</style>
+<script src="video.min.js"></script>
+</head>
+<body>
+<h1 id="title"></h1>
+<div id="host"></div>
+<pre id="out">running...</pre>
+<script>
+// t=vjs           : 기본 video.js. 원래 <video>에 단 리스너(React prop 자리)와 contentEl video에 단 리스너를 비교한다.
+// t=vjs-override  : Html5.prototype.movingMediaElementInDOM = true로 iOS 복제를 끈다.
+// t=vjs-ingest    : <div data-vjs-player>로 감싸 video.js가 요소를 옮기거나 복제하지 않게 한다.
+// t=nomove        : video.js 없이 <video>만. 대조군.
+// t=move-early    : video.js와 같은 방식으로, 넣자마자 래퍼 div 안으로 옮긴다.
+// t=move-meta     : loadedmetadata 뒤(재생 전)에 옮기고 재생한다.
+// t=move-playing  : 재생 중에 옮긴다.
+// t=noplay        : 재생하지 않고 preload="auto"만으로 loadeddata가 오는지 본다.
+// t=vjs-noplay    : video.js로 같은 것을 본다(PR의 "자동재생 아님 + loadeddata로 썸네일 해제" 전제).
+const q = new URLSearchParams(location.search);
+const T = q.get('t');
+const ID = q.get('id') || T;
+const WAIT_MS = 6000;
+const EVENTS = ['loadedmetadata', 'loadeddata', 'canplay', 'progress', 'play', 'playing', 'timeupdate'];
+const host = document.getElementById('host');
+const counts = {};
+const info = { id: ID, t: T, ua: navigator.userAgent, maxTouchPoints: navigator.maxTouchPoints };
+
+document.getElementById('title').textContent = T;
+
+const count = (label, eventName) => {
+  counts[label] = counts[label] || {};
+  counts[label][eventName] = (counts[label][eventName] || 0) + 1;
+};
+const listen = (el, label) => EVENTS.forEach(e => el.addEventListener(e, () => count(label, e)));
+const makeVideo = () => {
+  const v = document.createElement('video');
+  v.muted = true;
+  v.setAttribute('muted', '');
+  v.setAttribute('playsinline', '');
+  v.preload = 'auto';
+  v.src = 'clip.mp4';
+  return v;
+};
+// 화면에 프레임이 실제로 그려지는지는 스크린샷으로 보고, 여기서는 디코딩된 프레임 밝기만 본다(검은 화면이면 0 근처).
+const sampleFrame = v => {
+  try {
+    const c = document.createElement('canvas');
+    c.width = 32;
+    c.height = 18;
+    const ctx = c.getContext('2d');
+    ctx.drawImage(v, 0, 0, 32, 18);
+    const d = ctx.getImageData(0, 0, 32, 18).data;
+    let sum = 0;
+    for (let i = 0; i < d.length; i += 4) sum += d[i] + d[i + 1] + d[i + 2];
+    return Math.round(sum / (d.length / 4) / 3);
+  } catch (e) {
+    return 'err:' + e.message;
+  }
+};
+const mediaState = v => v && {
+  connected: v.isConnected,
+  currentTime: +v.currentTime.toFixed(2),
+  readyState: v.readyState,
+  paused: v.paused,
+  error: v.error && v.error.code,
+  frameAvg: sampleFrame(v),
+};
+const finish = extra => {
+  Object.assign(info, extra, { counts });
+  document.getElementById('out').textContent = JSON.stringify(info, null, 1);
+  fetch('/log', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(info) });
+};
+const playSafely = (target) => {
+  const p = target.play();
+  if (p && p.catch) p.catch(e => { info.playError = String(e); });
+};
+
+if (T.startsWith('vjs')) {
+  if (T === 'vjs-override') videojs.getTech('Html5').prototype.movingMediaElementInDOM = true;
+
+  const orig = makeVideo();
+  let container = host;
+
+  if (T === 'vjs-ingest') {
+    container = document.createElement('div');
+    container.setAttribute('data-vjs-player', '');
+    host.appendChild(container);
+  }
+  container.appendChild(orig);
+  listen(orig, 'orig');
+
+  const player = videojs(orig, { muted: true, controls: false, preload: 'auto' });
+  // VideoJsPlayer와 같은 방법으로 실제 재생 요소를 꺼낸다.
+  const actual = player.contentEl().getElementsByTagName('video')[0];
+
+  listen(actual, 'actual');
+  EVENTS.forEach(e => player.on(e, () => count('player.on', e)));
+  Object.assign(info, {
+    IS_IOS: videojs.browser.IS_IOS,
+    movingMediaElementInDOM: videojs.getTech('Html5').prototype.movingMediaElementInDOM,
+    videoCountInDocument: document.querySelectorAll('video').length,
+    actualIsOrig: actual === orig,
+  });
+  if (T !== 'vjs-noplay') player.ready(() => playSafely(player));
+  setTimeout(() => finish({ orig: mediaState(orig), actual: mediaState(actual) }), WAIT_MS);
+} else {
+  const v = makeVideo();
+  const moveIntoWrapper = () => {
+    const wrapper = document.createElement('div');
+    v.parentNode.insertBefore(wrapper, v);
+    wrapper.appendChild(v);
+    info.movedAtReadyState = v.readyState;
+  };
+
+  host.appendChild(v);
+  listen(v, 'video');
+
+  if (T === 'move-early') moveIntoWrapper();
+
+  if (T === 'move-meta') {
+    // 메타데이터만 받은 뒤(재생 전) 옮기고 재생한다.
+    v.addEventListener('loadedmetadata', () => { moveIntoWrapper(); playSafely(v); }, { once: true });
+  } else if (T === 'move-playing') {
+    // 재생이 시작되고 1초 뒤에 옮긴다. 옮긴 뒤에도 시간이 흐르는지 본다.
+    v.addEventListener('playing', () => setTimeout(() => {
+      info.timeAtMove = +v.currentTime.toFixed(2);
+      moveIntoWrapper();
+    }, 1000), { once: true });
+    playSafely(v);
+  } else if (T === 'noplay') {
+    // 재생하지 않고 preload="auto"만으로 첫 프레임(loadeddata)까지 오는지 본다.
+  } else {
+    playSafely(v);
+  }
+  setTimeout(() => finish({ video: mediaState(v), videoCountInDocument: document.querySelectorAll('video').length }), WAIT_MS);
+}
+</script>
+</body>
+</html>
